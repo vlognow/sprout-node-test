@@ -1,0 +1,24 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>SPROUT node-server test</title></head>
+<body>
+  <h1>SPROUT node-server validation prototype</h1>
+  <p>A real Express server (not a static build) reading PORT/DB_PATH from the environment, backed by SQLite.</p>
+  <form id="f"><input id="text" placeholder="a note"><button>Add</button></form>
+  <ul id="notes"></ul>
+  <script>
+    async function refresh() {
+      const notes = await (await fetch('/api/notes')).json();
+      document.getElementById('notes').innerHTML = notes.map(n => `<li>${n.text} (${n.created_at})</li>`).join('');
+    }
+    document.getElementById('f').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const text = document.getElementById('text').value;
+      await fetch('/api/notes', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({text}) });
+      document.getElementById('text').value = '';
+      refresh();
+    });
+    refresh();
+  </script>
+</body>
+</html>
