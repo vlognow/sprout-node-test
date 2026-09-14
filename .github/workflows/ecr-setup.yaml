@@ -1,0 +1,77 @@
+name: ECR Setup
+
+on:
+  workflow_dispatch:
+    inputs:
+      prototype_name:
+        description: 'Prototype name (kebab-case, e.g. my-calendar)'
+        required: true
+
+jobs:
+  setup-ecr:
+    name: Create ECR repository
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v6
+      with:
+        role-to-assume: arn:aws:iam::677637302876:role/github-actions-ecr
+        aws-region: us-east-1
+
+    - name: Create ECR repository
+      run: |
+        REPO_NAME="${{ github.event.inputs.prototype_name }}"
+
+        aws ecr describe-repositories --repository-names "$REPO_NAME" 2>/dev/null || \
+          aws ecr create-repository \
+            --repository-name "$REPO_NAME" \
+            --image-scanning-configuration scanOnPush=true \
+            --tags Key=prototype,Value=true "Key=owner,Value=$GITHUB_REPOSITORY_OWNER"
+
+        # Retry: the proto-ecr-push IAM policy is tag-conditioned, and
+        # resource tags on a just-created repo can take a few seconds
+        # to become visible to IAM (observed live: first attempt
+        # denied, retry succeeds).
+        for attempt in 1 2 3 4 5 6; do
+          if aws ecr put-lifecycle-policy \
+          --repository-name "$REPO_NAME" \
+          --lifecycle-policy-text '{
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images after 7 days",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 7
+                },
+                "action": {"type": "expire"}
+              },
+              {
+                "rulePriority": 2,
+                "description": "Keep only 10 tagged images",
+                "selection": {
+                  "tagStatus": "tagged",
+                  "tagPrefixList": ["sha-"],
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {"type": "expire"}
+              }
+            ]
+          }'; then
+            break
+          fi
+          if [ "$attempt" = "6" ]; then
+            echo "::error::put-lifecycle-policy still denied after 6 attempts"
+            exit 1
+          fi
+          echo "put-lifecycle-policy denied (attempt $attempt) — waiting for IAM tag propagation..."
+          sleep 10
+        done
+
+        echo "ECR repo ready: 677637302876.dkr.ecr.us-east-1.amazonaws.com/$REPO_NAME"

@@ -1,0 +1,55 @@
+name: trigger-security-review
+
+# Thin trigger: on every PR, ask the CENTRAL security pipeline in
+# vlognow/k8s-prototypes to review this PR. All powerful secrets
+# (ANTHROPIC_API_KEY, security-repo read) live in k8s-prototypes — a repo
+# created from this template only holds a narrowly-scoped dispatch token.
+#
+# The central workflow posts findings as a comment here and reports a commit
+# status named `security-review` on this PR's head SHA (that status is the
+# branch-protection gate).
+#
+# Token: PLATFORM_DISPATCH_TOKEN — a FINE-GRAINED PAT scoped to
+# vlognow/k8s-prototypes ONLY, with `Contents: Read and write` (the
+# repository_dispatch endpoint requires contents:write for fine-grained
+# tokens) and NO `workflow` permission. Falls back to the org-wide
+# REGISTRY_PAT until the dedicated token is provisioned.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    name: dispatch security-review
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send security-review dispatch to k8s-prototypes
+        env:
+          GH_TOKEN: ${{ secrets.PLATFORM_DISPATCH_TOKEN || secrets.REGISTRY_PAT }}
+          SRC_REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::No dispatch token (PLATFORM_DISPATCH_TOKEN / REGISTRY_PAT) available."
+            exit 1
+          fi
+          python3 - <<'PY' > dispatch.json
+          import json, os
+          print(json.dumps({
+            "event_type": "security-review",
+            "client_payload": {
+              "repo": os.environ["SRC_REPO"],
+              "pr_number": os.environ["PR"],
+              "sha": os.environ["SHA"],
+              "base_ref": os.environ["BASE"],
+            },
+          }))
+          PY
+          gh api -X POST repos/vlognow/k8s-prototypes/dispatches --input dispatch.json
+          echo "Dispatched security-review for $SRC_REPO#$PR @ $SHA"

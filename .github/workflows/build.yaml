@@ -1,0 +1,82 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build and push image
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v6
+      with:
+        role-to-assume: arn:aws:iam::677637302876:role/github-actions-ecr
+        aws-region: us-east-1
+
+    - name: Login to Amazon ECR
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Build, push, and open tag-bump PR
+      env:
+        GH_TOKEN: ${{ secrets.REGISTRY_PAT }}
+      run: |
+        TAG="sha-${GITHUB_SHA::8}"
+        IMAGE="677637302876.dkr.ecr.us-east-1.amazonaws.com/sprout-node-test:$TAG"
+
+        # Unsubstituted __PORT__ means the port patch was skipped — fail
+        # loud here instead of CrashLooping in-cluster (k8s-prototypes#79).
+        # nginx.node.conf carries the node path's listen port, so check it too.
+        for f in Dockerfile nginx.node.conf; do
+          if [ -f "$f" ] && grep -q __PORT__ "$f"; then
+            echo "::error::unsubstituted __PORT__ in $f"
+            exit 1
+          fi
+        done
+        docker build -f Dockerfile -t "$IMAGE" .
+        # ECR IAM tag propagation can lag provisioning (k8s-prototypes#40):
+        # first pushes get InitiateLayerUpload/CompleteLayerUpload denials.
+        for attempt in 1 2 3; do
+          if docker push "$IMAGE"; then break; fi
+          if [ "$attempt" = "3" ]; then echo "::error::docker push failed after 3 attempts"; exit 1; fi
+          sleep $(( attempt * 30 ))
+        done
+
+        REGISTRY_FILE="registry/sprout-node-test.yaml"
+        # Wire git's credential helper to gh so the raw `git push`
+        # below authenticates with GH_TOKEN (gh repo clone alone only
+        # covers the clone itself).
+        gh auth setup-git
+        cd /tmp
+        gh repo clone vlognow/k8s-prototypes registry-update
+        cd registry-update
+
+        if [ ! -f "$REGISTRY_FILE" ]; then
+          echo "No registry entry at $REGISTRY_FILE yet — skipping tag-bump PR"
+          exit 0
+        fi
+
+        BRANCH="auto/tag-bump-sprout-node-test-${TAG}"
+        git checkout -b "$BRANCH"
+        sed -i "s/^tag: .*/tag: $TAG/" "$REGISTRY_FILE"
+
+        git config user.email "github-actions@machinify.com"
+        git config user.name "GitHub Actions"
+        git add "$REGISTRY_FILE"
+        git commit -m "chore: bump sprout-node-test tag to $TAG"
+        git push -u origin "$BRANCH"
+
+        gh label create "auto-tag-bump" --repo vlognow/k8s-prototypes --color "0075ca" --description "Automated tag bump PR" 2>/dev/null || true
+
+        gh pr create \
+          --repo vlognow/k8s-prototypes \
+          --title "chore: bump sprout-node-test to $TAG" \
+          --body "Automated tag bump from build ${GITHUB_SHA::8} in \`${GITHUB_REPOSITORY}\`." \
+          --label "auto-tag-bump"
