@@ -1,0 +1,29 @@
+name: Auto-merge on green
+
+# Arms GitHub auto-merge on every non-draft PR so prototype changes land
+# without human interaction. Branch protection (gitleaks + security-review)
+# still gates the actual merge — this only removes the click.
+#
+# Token: must be a PAT, NOT the workflow's GITHUB_TOKEN. Auto-merge is
+# attributed to the identity that enabled it, and merges enabled by
+# github-actions[bot] do not trigger push workflows — build.yaml would
+# silently never run on merged PRs (no image, no tag-bump). REGISTRY_PAT
+# is used until the platform GitHub App replaces it (k8s-prototypes#34).
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review]
+
+permissions: {}
+
+jobs:
+  arm:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enable auto-merge
+        env:
+          GH_TOKEN: ${{ secrets.REGISTRY_PAT }}
+        run: |
+          gh pr merge "${{ github.event.pull_request.html_url }}" --auto --squash \
+            || echo "::warning::Could not arm auto-merge — check that branch protection with required checks exists on this repo."
