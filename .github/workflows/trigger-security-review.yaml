@@ -2,54 +2,53 @@ name: trigger-security-review
 
 # Thin trigger: on every PR, ask the CENTRAL security pipeline in
 # vlognow/k8s-prototypes to review this PR. All powerful secrets
-# (ANTHROPIC_API_KEY, security-repo read) live in k8s-prototypes — a repo
-# created from this template only holds a narrowly-scoped dispatch token.
+# (ANTHROPIC_API_KEY, security-repo read, the Machi SRE app key) live in
+# k8s-prototypes; this repo only holds the dispatch-only SPROUT CI app, which
+# can start workflows in k8s-prototypes and nothing else.
 #
-# The central workflow posts findings as a comment here and reports a commit
-# status named `security-review` on this PR's head SHA (that status is the
-# branch-protection gate).
-#
-# Token: PLATFORM_DISPATCH_TOKEN — a FINE-GRAINED PAT scoped to
-# vlognow/k8s-prototypes ONLY, with `Contents: Read and write` (the
-# repository_dispatch endpoint requires contents:write for fine-grained
-# tokens) and NO `workflow` permission. Falls back to the org-wide
-# REGISTRY_PAT until the dedicated token is provisioned.
+# The central workflow identifies this repo by its signed GitHub OIDC token
+# (not by the repo/PR it is told), posts findings as a comment here, reports
+# a commit status named `security-review` on the PR's head SHA (the
+# branch-protection gate), and after a PASS arms auto-merge on this PR.
+# ready_for_review re-runs the review so a PR undrafted after its first
+# review still gets auto-merge.
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
   contents: read
+  id-token: write  # OIDC token identifying this repo and PR to k8s-prototypes
 
 jobs:
   dispatch:
     name: dispatch security-review
     runs-on: ubuntu-latest
     steps:
-      - name: Send security-review dispatch to k8s-prototypes
+      - name: Mint SPROUT CI dispatch token
+        id: dispatch-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.SPROUT_CI_GITHUB_CLIENT_ID }}
+          private-key: ${{ secrets.SPROUT_CI_GITHUB_KEY }}
+          owner: vlognow
+          repositories: k8s-prototypes
+          permission-actions: write
+
+      - name: Request security review in k8s-prototypes
         env:
-          GH_TOKEN: ${{ secrets.PLATFORM_DISPATCH_TOKEN || secrets.REGISTRY_PAT }}
+          GH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
           SRC_REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
           SHA: ${{ github.event.pull_request.head.sha }}
           BASE: ${{ github.event.pull_request.base.ref }}
         run: |
           set -euo pipefail
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::error::No dispatch token (PLATFORM_DISPATCH_TOKEN / REGISTRY_PAT) available."
-            exit 1
-          fi
-          python3 - <<'PY' > dispatch.json
-          import json, os
-          print(json.dumps({
-            "event_type": "security-review",
-            "client_payload": {
-              "repo": os.environ["SRC_REPO"],
-              "pr_number": os.environ["PR"],
-              "sha": os.environ["SHA"],
-              "base_ref": os.environ["BASE"],
-            },
-          }))
-          PY
-          gh api -X POST repos/vlognow/k8s-prototypes/dispatches --input dispatch.json
-          echo "Dispatched security-review for $SRC_REPO#$PR @ $SHA"
+          ID_TOKEN=$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=k8s-prototypes-security-review" | jq -r .value)
+          echo "::add-mask::$ID_TOKEN"
+          gh workflow run security-review.yaml -R vlognow/k8s-prototypes --ref main \
+            -f repo="$SRC_REPO" -f pr_number="$PR" -f sha="$SHA" -f base_ref="$BASE" \
+            -f id_token="$ID_TOKEN"
+          echo "Requested security-review for $SRC_REPO#$PR @ $SHA"

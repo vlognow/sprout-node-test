@@ -24,9 +24,8 @@ jobs:
     - name: Login to Amazon ECR
       uses: aws-actions/amazon-ecr-login@v2
 
-    - name: Build, push, and open tag-bump PR
-      env:
-        GH_TOKEN: ${{ secrets.REGISTRY_PAT }}
+    - name: Build and push image
+      id: build
       run: |
         TAG="sha-${GITHUB_SHA::8}"
         IMAGE="677637302876.dkr.ecr.us-east-1.amazonaws.com/sprout-node-test:$TAG"
@@ -48,35 +47,29 @@ jobs:
           if [ "$attempt" = "3" ]; then echo "::error::docker push failed after 3 attempts"; exit 1; fi
           sleep $(( attempt * 30 ))
         done
+        echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-        REGISTRY_FILE="registry/sprout-node-test.yaml"
-        # Wire git's credential helper to gh so the raw `git push`
-        # below authenticates with GH_TOKEN (gh repo clone alone only
-        # covers the clone itself).
-        gh auth setup-git
-        cd /tmp
-        gh repo clone vlognow/k8s-prototypes registry-update
-        cd registry-update
+    - name: Mint sprout-ci dispatch token
+      id: dispatch-token
+      uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+      with:
+        client-id: ${{ vars.SPROUT_CI_GITHUB_CLIENT_ID }}
+        private-key: ${{ secrets.SPROUT_CI_GITHUB_KEY }}
+        owner: vlognow
+        repositories: k8s-prototypes
+        permission-actions: write
 
-        if [ ! -f "$REGISTRY_FILE" ]; then
-          echo "No registry entry at $REGISTRY_FILE yet — skipping tag-bump PR"
-          exit 0
-        fi
-
-        BRANCH="auto/tag-bump-sprout-node-test-${TAG}"
-        git checkout -b "$BRANCH"
-        sed -i "s/^tag: .*/tag: $TAG/" "$REGISTRY_FILE"
-
-        git config user.email "github-actions@machinify.com"
-        git config user.name "GitHub Actions"
-        git add "$REGISTRY_FILE"
-        git commit -m "chore: bump sprout-node-test tag to $TAG"
-        git push -u origin "$BRANCH"
-
-        gh label create "auto-tag-bump" --repo vlognow/k8s-prototypes --color "0075ca" --description "Automated tag bump PR" 2>/dev/null || true
-
-        gh pr create \
-          --repo vlognow/k8s-prototypes \
-          --title "chore: bump sprout-node-test to $TAG" \
-          --body "Automated tag bump from build ${GITHUB_SHA::8} in \`${GITHUB_REPOSITORY}\`." \
-          --label "auto-tag-bump"
+    - name: Request tag bump in k8s-prototypes
+      env:
+        GH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
+        TAG: ${{ steps.build.outputs.tag }}
+      run: |
+        set -euo pipefail
+        # k8s-prototypes' tag-bump.yaml identifies this repo by its signed
+        # GitHub OIDC token (needs the job's id-token: write), validates the
+        # request, and opens the tag-bump PR as machi-sre[bot].
+        ID_TOKEN=$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+          "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=k8s-prototypes-tag-bump" | jq -r .value)
+        echo "::add-mask::$ID_TOKEN"
+        gh workflow run tag-bump.yaml -R vlognow/k8s-prototypes --ref main \
+          -f name="sprout-node-test" -f tag="$TAG" -f id_token="$ID_TOKEN"
